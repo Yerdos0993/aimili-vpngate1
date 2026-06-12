@@ -244,6 +244,17 @@ def load_state():
             pass
     return state
 
+def load_slots():
+    import json
+    path = "/opt/aimilivpn/vpngate_data/slots.json"
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
 def get_active_node_info():
     import json
     path = "/opt/aimilivpn/vpngate_data/nodes.json"
@@ -351,6 +362,8 @@ def check_openvpn_process():
                 try:
                     with open(os.path.join('/proc', pid_dir, 'cmdline'), 'r') as f:
                         cmd = f.read().replace('\x00', ' ')
+                        if 'AIMILI_SLOT' in cmd:
+                            continue
                         if 'openvpn' in cmd and ('/opt/aimilivpn/vpngate_data' in cmd or '/opt/aimilivpn/vpngate_data/configs' in cmd):
                             return True
                 except Exception:
@@ -418,6 +431,20 @@ def print_status():
     print_line(format_line(f"代理网关 (Port {proxy_port})", gateway_status))
     print_line(format_line(f"管理后台 (Port {ui_port})", backend_status))
     print_line(format_line("连接核心 (OpenVPN)", openvpn_status))
+
+    slots_info = load_slots()
+    desired_slots = slots_info.get("desired_count", 0)
+    if desired_slots and int(desired_slots) > 0:
+        slot_list = slots_info.get("slots", [])
+        up_slots = sum(1 for s in slot_list if s.get("status") == "up")
+        port_base = (slot_list[0].get("port") if slot_list else 17928) or 17928
+        if up_slots >= int(desired_slots):
+            multi_status = f"{green}[{up_slots}/{desired_slots} 运行中]{reset}"
+        elif up_slots > 0:
+            multi_status = f"{yellow}[{up_slots}/{desired_slots} 运行中]{reset}"
+        else:
+            multi_status = f"{red}[0/{desired_slots} 未就绪]{reset}"
+        print_line(format_line(f"多出口住宅IP (Port {port_base}+)", multi_status))
     
     host_cfg = cfg.get("host", "::")
     if host_cfg in ("127.0.0.1", "localhost"):
