@@ -15,6 +15,7 @@
   - **per-slot 自动漂移**：某槽位节点掉线时自动从健康住宅节点池补齐。
   - **逐槽位地区过滤**：可给每个槽位单独设定地区（如槽位0=KR、槽位1=JP），留空跟随全局；API `POST /api/set_slot_country`。
   - **手动换 IP**：每个槽位可一键重摇到同地区的另一住宅节点，应对不同运营商 IP 质量差异；API `POST /api/switch_exit_slot`。
+  - **节点列表直接指派 + 锁定**：主节点列表「操作」列新增「多出口▾」，可把指定 IP/运营商节点「切换到槽位 #N」或「新增槽位用此 IP」；被指派节点会锁定(pin)且行内显示 `出口#N` 角标；供给器优先使用锁定节点，失效时临时回退保连通。API `POST /api/assign_slot_node`、`POST /api/add_slot_with_node`。
   - **一键导出 3x-ui / Xray 出站配置**（`outbounds` + `routing.rules` 模板）。
   - 新增 API：`GET /api/exit_slots`、`POST /api/update_exit_slots`、`GET /api/exit_slots/3xui`。
   - 槽位状态持久化到 `slots.json`。

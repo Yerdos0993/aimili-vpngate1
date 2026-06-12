@@ -1920,6 +1920,33 @@ def per_slot_country(i: int) -> str:
     """返回某槽位的地区过滤：优先用该槽位单独设定，否则回退到全局设置。"""
     return get_slot_country_map().get(str(i), "") or get_exit_slot_config()["country"]
 
+def get_slot_pin_map() -> dict[str, str]:
+    cfg = load_ui_config()
+    raw = cfg.get("exit_slot_pin_map") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if v}
+
+def set_slot_pin(i: int, node_id: Any) -> dict[str, str]:
+    with lock:
+        auth_file = DATA_DIR / "ui_auth.json"
+        cfg = load_ui_config()
+        pm = cfg.get("exit_slot_pin_map")
+        if not isinstance(pm, dict):
+            pm = {}
+        nid = str(node_id or "").strip()
+        if nid:
+            pm[str(i)] = nid
+        else:
+            pm.pop(str(i), None)
+        cfg["exit_slot_pin_map"] = pm
+        try:
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            auth_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"[多出口] 保存槽位锁定失败: {e}", flush=True)
+    return get_slot_pin_map()
+
 def set_slot_country(i: int, country: Any) -> dict[str, str]:
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
@@ -1943,6 +1970,18 @@ def set_slot_country(i: int, country: Any) -> dict[str, str]:
 def current_slot_node_ids() -> set[str]:
     with exit_slots_lock:
         return {s.get("node_id") for s in exit_slots.values() if s.get("node_id")}
+
+def pick_slot_node(i: int, used_ids: set[str]) -> dict[str, Any] | None:
+    """为槽位 i 选节点：优先用户锁定(pin)的节点（仍可用且未被其他槽位占用），否则按本槽地区自动选最优。"""
+    pin = get_slot_pin_map().get(str(i))
+    if pin and pin not in used_ids:
+        node = next((n for n in read_nodes()
+                     if n.get("id") == pin and n.get("probe_status") == "available"), None)
+        if node:
+            return node
+    cfg = get_exit_slot_config()
+    picks = select_slot_nodes(used_ids, 1, per_slot_country(i), cfg["residential_only"])
+    return picks[0] if picks else None
 
 def select_slot_nodes(used_ids: set[str], need: int, country: str, residential_only: bool) -> list[dict[str, Any]]:
     if need <= 0:
@@ -2114,10 +2153,10 @@ def supervise_exit_slots_once() -> None:
                 continue
             tear_down_slot(i, stop_proxy=False)  # 清理死进程/路由，保留已分配的代理端口
             used = current_slot_node_ids()
-            picks = select_slot_nodes(used, 1, per_slot_country(i), cfg["residential_only"])
-            if picks:
-                if not bring_up_slot(i, picks[0]):
-                    mark_slot_pending(i, f"节点 {picks[0].get('id')} 连接失败，待重试")
+            node = pick_slot_node(i, used)
+            if node:
+                if not bring_up_slot(i, node):
+                    mark_slot_pending(i, f"节点 {node.get('id')} 连接失败，待重试")
             else:
                 scope = per_slot_country(i) or "不限地区"
                 mark_slot_pending(i, f"暂无可用住宅节点（{scope}），等待节点池补齐")
@@ -2134,6 +2173,8 @@ def switch_slot_node(i: int) -> dict[str, Any]:
     if not exit_slots_supervise_lock.acquire(blocking=False):
         return {"ok": False, "error": "供给器正忙，请稍后重试"}
     try:
+        # 手动换 IP 视为放弃锁定，清除该槽 pin，确保按地区切到“不同”节点
+        set_slot_pin(i, "")
         # 当前节点已在 exit_slots 中，current_slot_node_ids() 会把它纳入排除集，确保切到不同 IP
         used = current_slot_node_ids()
         picks = select_slot_nodes(used, 1, per_slot_country(i), cfg["residential_only"])
@@ -2148,6 +2189,58 @@ def switch_slot_node(i: int) -> dict[str, Any]:
         return {"ok": False, "error": f"切换到节点 {picks[0].get('id')} 失败，将自动重试"}
     finally:
         exit_slots_supervise_lock.release()
+
+def assign_node_to_slot(i: int, node_id: str) -> dict[str, Any]:
+    """把指定节点(IP)分配到某个已存在的槽位并锁定，立即拨号。"""
+    cfg = get_exit_slot_config()
+    if i < 0 or i >= cfg["count"]:
+        return {"ok": False, "error": "槽位超出当前出口数量范围"}
+    node_id = str(node_id or "").strip()
+    node = next((n for n in read_nodes() if n.get("id") == node_id), None)
+    if not node:
+        return {"ok": False, "error": "未找到该节点"}
+    if node.get("probe_status") != "available":
+        return {"ok": False, "error": "该节点当前不可用，请先在列表中检测/更新"}
+    with exit_slots_lock:
+        for idx, s in exit_slots.items():
+            if idx != i and s.get("node_id") == node_id:
+                return {"ok": False, "error": f"该节点已被槽位 #{idx} 使用，无法重复分配"}
+    if not exit_slots_supervise_lock.acquire(blocking=False):
+        return {"ok": False, "error": "供给器正忙，请稍后重试"}
+    try:
+        set_slot_pin(i, node_id)
+        tear_down_slot(i, stop_proxy=False)
+        if bring_up_slot(i, node):
+            write_slots_state()
+            return {"ok": True, "slot": i, "ip": node.get("ip"), "country": node.get("country")}
+        mark_slot_pending(i, f"分配节点 {node_id} 后连接失败，待自动重试")
+        write_slots_state()
+        return {"ok": False, "error": f"分配到槽位 #{i} 失败，将自动重试"}
+    finally:
+        exit_slots_supervise_lock.release()
+
+def add_slot_with_node(node_id: str) -> dict[str, Any]:
+    """新增一个槽位并锁定到指定节点(IP)。"""
+    cfg = get_exit_slot_config()
+    new_idx = cfg["count"]
+    if new_idx >= MAX_EXIT_SLOTS:
+        return {"ok": False, "error": f"已达到最大出口数量 {MAX_EXIT_SLOTS}"}
+    node_id = str(node_id or "").strip()
+    node = next((n for n in read_nodes() if n.get("id") == node_id), None)
+    if not node:
+        return {"ok": False, "error": "未找到该节点"}
+    if node.get("probe_status") != "available":
+        return {"ok": False, "error": "该节点当前不可用，请先在列表中检测/更新"}
+    with exit_slots_lock:
+        for idx, s in exit_slots.items():
+            if s.get("node_id") == node_id:
+                return {"ok": False, "error": f"该节点已被槽位 #{idx} 使用"}
+    set_slot_pin(new_idx, node_id)
+    set_exit_slot_config(count=new_idx + 1)
+    result = assign_node_to_slot(new_idx, node_id)
+    if result.get("ok"):
+        result["message"] = f"已新增槽位 #{new_idx}（端口 {slot_port(new_idx)}）并锁定该节点"
+    return result
 
 def exit_slots_loop() -> None:
     global last_exit_slots_heartbeat
@@ -3838,6 +3931,7 @@ INDEX_HTML = r"""<!doctype html>
 </main>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
+let slotByNode = {}, slotMeta = { count: 0, max: 16 };
 let currentPage = 1;
 const pageSize = 99999;
 let currentPageNodes = [];
@@ -4187,9 +4281,26 @@ function render(){
         ? `<button class="test-btn" style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">★ 已收藏</button>`
         : `<button class="test-btn" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">☆ 收藏</button>`;
 
+      // 多出口分配：显示该节点当前所属槽位，并提供「分配到槽位 / 新增槽位用此IP」下拉
+      const assignedSlot = slotByNode[n.id];
+      const slotBadge = (assignedSlot !== undefined)
+        ? `<span class="badge available" style="margin-right:6px;" title="该节点正用于多出口槽位 #${assignedSlot}">出口#${assignedSlot}</span>`
+        : '';
+      let slotOpts = '';
+      for (let si = 0; si < (slotMeta.count || 0); si++) {
+        slotOpts += `<option value="assign:${si}">→ 切换到槽位 #${si}</option>`;
+      }
+      if ((slotMeta.count || 0) < (slotMeta.max || 16)) {
+        slotOpts += `<option value="add">+ 新增槽位用此IP</option>`;
+      }
+      const canMulti = !isUnavailable && slotOpts !== '';
+      const multiSelect = canMulti
+        ? `<select onchange="onSlotAssign('${esc(n.id)}', this)" title="多出口分配" style="height:30px;font-size:12px;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);color:var(--text-secondary);border-radius:6px;padding:0 6px;cursor:pointer;max-width:120px;"><option value="">多出口▾</option>${slotOpts}</select>`
+        : '';
+
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
-        <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${slotBadge}${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(displayLocation)}">${esc(displayLocation)}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
         <td style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(translateIpType(n.ip_type))}">${esc(translateIpType(n.ip_type))}</td>
@@ -4197,6 +4308,7 @@ function render(){
           <div class="table-actions">
             ${favBtn}
             ${connectBtn}
+            ${multiSelect}
           </div>
         </td>
       </tr>`;
@@ -4377,6 +4489,46 @@ async function load(){
     startConnectionPolling();
   }
 }
+
+async function refreshSlotMap(){
+  try {
+    const r = await fetch("./api/exit_slots");
+    const d = await r.json();
+    const map = {};
+    (d.slots || []).forEach(s => { if (s.node_id) map[s.node_id] = s.slot; });
+    slotByNode = map;
+    slotMeta = { count: (d.config && d.config.count) || 0, max: d.max_slots || 16 };
+    render();
+  } catch(e) {}
+}
+
+async function onSlotAssign(nodeId, sel){
+  const val = sel.value;
+  sel.value = "";
+  if (!val) return;
+  try {
+    let res;
+    if (val === "add") {
+      res = await fetch("./api/add_slot_with_node", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ node_id: nodeId }) });
+    } else if (val.indexOf("assign:") === 0) {
+      const slot = parseInt(val.split(":")[1], 10);
+      res = await fetch("./api/assign_slot_node", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ slot: slot, node_id: nodeId }) });
+    } else { return; }
+    const data = await res.json();
+    if (data.ok) {
+      alert(data.message || ('已分配到槽位 #' + (data.slot !== undefined ? data.slot : '')));
+    } else {
+      alert(data.error || '操作失败');
+    }
+  } catch(e) {
+    alert('请求失败: ' + e);
+  } finally {
+    refreshSlotMap();
+  }
+}
+
+setInterval(refreshSlotMap, 6000);
+refreshSlotMap();
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
@@ -5764,6 +5916,7 @@ class Handler(BaseHTTPRequestHandler):
                 "proxy_host": "127.0.0.1",
                 "port_base": SLOT_PORT_BASE,
                 "country_map": get_slot_country_map(),
+                "pin_map": get_slot_pin_map(),
                 "slots": state.get("slots", []),
                 "updated_at": state.get("updated_at", 0),
             })
@@ -6059,6 +6212,33 @@ class Handler(BaseHTTPRequestHandler):
                 result = switch_slot_node(int(slot))
                 status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                 self.send_json(result, status)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        elif effective_path == "/api/assign_slot_node":
+            try:
+                payload = self.read_json_body()
+                slot = payload.get("slot")
+                node_id = str(payload.get("node_id") or "").strip()
+                if slot is None or not str(slot).strip().lstrip("-").isdigit() or not node_id:
+                    self.send_json({"ok": False, "error": "缺少槽位号或节点 ID"}, HTTPStatus.BAD_REQUEST)
+                    return
+                result = assign_node_to_slot(int(slot), node_id)
+                self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        elif effective_path == "/api/add_slot_with_node":
+            try:
+                payload = self.read_json_body()
+                node_id = str(payload.get("node_id") or "").strip()
+                if not node_id:
+                    self.send_json({"ok": False, "error": "缺少节点 ID"}, HTTPStatus.BAD_REQUEST)
+                    return
+                result = add_slot_with_node(node_id)
+                self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
