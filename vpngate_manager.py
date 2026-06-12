@@ -1937,10 +1937,11 @@ def get_exit_slot_config() -> dict[str, Any]:
         "active": active,
         "paused": sorted(get_paused_slots() & set(active)),
         "country": str(cfg.get("exit_slot_country", "") or "").strip().upper(),
+        "isp": str(cfg.get("exit_slot_isp", "") or "").strip(),
         "residential_only": bool(cfg.get("exit_slot_residential_only", True)),
     }
 
-def set_exit_slot_config(count: Any = None, country: Any = None, residential_only: Any = None) -> dict[str, Any]:
+def set_exit_slot_config(count: Any = None, country: Any = None, residential_only: Any = None, isp: Any = None) -> dict[str, Any]:
     with lock:
         cfg = load_ui_config()
         active = paused = None
@@ -1950,6 +1951,8 @@ def set_exit_slot_config(count: Any = None, country: Any = None, residential_onl
             paused = get_paused_slots() & set(active)
         if country is not None:
             cfg["exit_slot_country"] = str(country or "").strip().upper()
+        if isp is not None:
+            cfg["exit_slot_isp"] = str(isp or "").strip()
         if residential_only is not None:
             cfg["exit_slot_residential_only"] = bool(residential_only)
         try:
@@ -2024,6 +2027,37 @@ def per_slot_country(i: int) -> str:
     """返回某槽位的地区过滤：优先用该槽位单独设定，否则回退到全局设置。"""
     return get_slot_country_map().get(str(i), "") or get_exit_slot_config()["country"]
 
+def get_slot_isp_map() -> dict[str, str]:
+    cfg = load_ui_config()
+    raw = cfg.get("exit_slot_isp_map") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v or "").strip() for k, v in raw.items()}
+
+def per_slot_isp(i: int) -> str:
+    """返回某槽位的运营商(ISP)过滤：优先用该槽位单独设定，否则回退到全局多出口 ISP 设置。"""
+    return get_slot_isp_map().get(str(i), "") or get_exit_slot_config().get("isp", "")
+
+def set_slot_isp(i: int, isp: Any) -> dict[str, str]:
+    with lock:
+        auth_file = DATA_DIR / "ui_auth.json"
+        cfg = load_ui_config()
+        m_ = cfg.get("exit_slot_isp_map")
+        if not isinstance(m_, dict):
+            m_ = {}
+        val = str(isp or "").strip()
+        if val:
+            m_[str(i)] = val
+        else:
+            m_.pop(str(i), None)
+        cfg["exit_slot_isp_map"] = m_
+        try:
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            auth_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"[多出口] 保存槽位 ISP 失败: {e}", flush=True)
+    return get_slot_isp_map()
+
 def get_slot_pin_map() -> dict[str, str]:
     cfg = load_ui_config()
     raw = cfg.get("exit_slot_pin_map") or {}
@@ -2084,13 +2118,14 @@ def pick_slot_node(i: int, used_ids: set[str]) -> dict[str, Any] | None:
         if node:
             return node
     cfg = get_exit_slot_config()
-    picks = select_slot_nodes(used_ids, 1, per_slot_country(i), cfg["residential_only"])
+    picks = select_slot_nodes(used_ids, 1, per_slot_country(i), cfg["residential_only"], per_slot_isp(i))
     return picks[0] if picks else None
 
-def select_slot_nodes(used_ids: set[str], need: int, country: str, residential_only: bool) -> list[dict[str, Any]]:
+def select_slot_nodes(used_ids: set[str], need: int, country: str, residential_only: bool, isp: str = "") -> list[dict[str, Any]]:
     if need <= 0:
         return []
     countries = [c.strip() for c in country.split(",") if c.strip()] if country else []
+    isp_kws = [k.strip().lower() for k in isp.split(",") if k.strip()] if isp else []
     pool: list[dict[str, Any]] = []
     for n in read_nodes():
         if n.get("id") in used_ids:
@@ -2101,6 +2136,10 @@ def select_slot_nodes(used_ids: set[str], need: int, country: str, residential_o
             continue
         if countries and str(n.get("country_short", "")).upper() not in countries:
             continue
+        if isp_kws:
+            hay = (str(n.get("owner", "")) + " " + str(n.get("as_name", "")) + " " + str(n.get("asn", ""))).lower()
+            if not any(kw in hay for kw in isp_kws):
+                continue
         pool.append(n)
     pool.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
     return pool[:need]
@@ -2203,6 +2242,7 @@ def slot_process_alive(i: int) -> bool:
 
 def write_slots_state() -> None:
     country_map = get_slot_country_map()
+    isp_map = get_slot_isp_map()
     with exit_slots_lock:
         snapshot = []
         for i in sorted(exit_slots.keys()):
@@ -2218,6 +2258,7 @@ def write_slots_state() -> None:
                 "status": "up" if alive else s.get("status", "down"),
                 "message": s.get("message", ""), "since": s.get("since", 0),
                 "country_filter": country_map.get(str(i), ""),
+                "isp_filter": isp_map.get(str(i), ""),
             })
     cfg = get_exit_slot_config()
     write_json(SLOTS_FILE, {
@@ -2300,9 +2341,9 @@ def switch_slot_node(i: int) -> dict[str, Any]:
         set_slot_pin(i, "")
         # 当前节点已在 exit_slots 中，current_slot_node_ids() 会把它纳入排除集，确保切到不同 IP
         used = current_slot_node_ids()
-        picks = select_slot_nodes(used, 1, per_slot_country(i), cfg["residential_only"])
+        picks = select_slot_nodes(used, 1, per_slot_country(i), cfg["residential_only"], per_slot_isp(i))
         if not picks:
-            return {"ok": False, "error": "没有其他可用住宅节点可切换（可放宽地区过滤或稍后重试）"}
+            return {"ok": False, "error": "没有其他可用住宅节点可切换（可放宽地区/运营商过滤或稍后重试）"}
         tear_down_slot(i, stop_proxy=False)
         if bring_up_slot(i, picks[0]):
             write_slots_state()
@@ -3710,6 +3751,10 @@ INDEX_HTML = r"""<!doctype html>
           <label class="form-label" for="slot_country">国家过滤 (留空=不限)</label>
           <input type="text" id="slot_country" class="input-field" placeholder="如 JP 或 JP,KR">
         </div>
+      </div>
+      <div class="form-group" style="margin-bottom: 14px;">
+        <label class="form-label" for="slot_isp">运营商(ISP)过滤 (留空=不限，全局默认)</label>
+        <input type="text" id="slot_isp" class="input-field" placeholder="如 NTT,So-net,KDDI（逗号分隔，匹配运营主体）">
       </div>
       <div class="form-group" style="margin-bottom: 14px; display: flex; align-items: center; gap: 8px;">
         <input type="checkbox" id="slot_residential" checked style="width: 16px; height: 16px; cursor: pointer;">
@@ -5279,6 +5324,7 @@ async function loadExitSlots(fillForm) {
       $("slot_count").value = data.config.count;
       $("slot_count").max = data.max_slots || 16;
       $("slot_country").value = data.config.country || "";
+      if ($("slot_isp")) $("slot_isp").value = data.config.isp || "";
       $("slot_residential").checked = data.config.residential_only !== false;
     }
     renderExitSlots(data);
@@ -5290,11 +5336,13 @@ async function loadExitSlots(fillForm) {
 function renderExitSlots(data) {
   const wrap = $("exit_slots_list");
   const active = document.activeElement;
-  if (active && active.id && active.id.indexOf('slot_cf_') === 0) return;
+  if (active && active.id && (active.id.indexOf('slot_cf_') === 0 || active.id.indexOf('slot_isp_') === 0)) return;
   const slots = (data && data.slots) || [];
   const desired = (data && data.config) ? data.config.count : 0;
   const countryMap = (data && data.country_map) || {};
+  const ispMap = (data && data.isp_map) || {};
   const globalCountry = (data && data.config) ? (data.config.country || '') : '';
+  const globalIsp = (data && data.config) ? (data.config.isp || '') : '';
   if (desired === 0 && slots.length === 0) {
     wrap.innerHTML = '<div style="color: var(--text-secondary); font-size: 13px; text-align: center; padding: 16px;">多出口未启用。把「出口数量」设为大于 0 并点击应用即可开启。</div>';
     return;
@@ -5304,6 +5352,7 @@ function renderExitSlots(data) {
     return;
   }
   const ph = globalCountry ? ('跟随全局 ' + globalCountry) : '不限地区';
+  const iph = globalIsp ? ('跟随全局 ' + globalIsp) : '不限运营商';
   let html = '';
   slots.forEach(function(s) {
     const paused = s.status === 'paused';
@@ -5315,6 +5364,7 @@ function renderExitSlots(data) {
     const ipType = s.ip_type === 'residential' ? '住宅' : (s.ip_type === 'mobile' ? '移动' : (s.ip_type === 'hosting' ? '机房' : (s.ip_type || '—')));
     const msg = (!up && s.message) ? ('<div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">' + s.message + '</div>') : '';
     const cf = (s.country_filter !== undefined ? s.country_filter : (countryMap[String(s.slot)] || ''));
+    const sf = (s.isp_filter !== undefined ? s.isp_filter : (ispMap[String(s.slot)] || ''));
     const bs = 'flex-shrink:0;height:28px;padding:0 10px;font-size:12px;font-weight:600;border-radius:6px;border:1px solid var(--border-color);background:transparent;cursor:pointer;';
     // 运行/停止切换按钮
     const startStopBtn = paused
@@ -5334,9 +5384,14 @@ function renderExitSlots(data) {
         + switchBtn + startStopBtn + delBtn
       + '</div>'
       + '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;">'
-        + '<span style="font-size:11px;color:var(--text-secondary);flex-shrink:0;">本槽地区</span>'
+        + '<span style="font-size:11px;color:var(--text-secondary);flex-shrink:0;width:52px;">本槽地区</span>'
         + '<input type="text" id="slot_cf_' + s.slot + '" value="' + cf + '" placeholder="' + ph + '" style="flex:1;min-width:0;height:28px;font-size:12px;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);color:var(--text-primary);border-radius:6px;padding:0 8px;outline:none;">'
         + '<button type="button" onclick="saveSlotCountry(' + s.slot + ',this)" style="flex-shrink:0;height:28px;padding:0 10px;font-size:12px;font-weight:600;border-radius:6px;border:1px solid var(--border-color);background:transparent;color:var(--text-secondary);cursor:pointer;">设定</button>'
+      + '</div>'
+      + '<div style="display:flex;align-items:center;gap:8px;margin-top:6px;">'
+        + '<span style="font-size:11px;color:var(--text-secondary);flex-shrink:0;width:52px;">本槽运营商</span>'
+        + '<input type="text" id="slot_isp_' + s.slot + '" value="' + (sf || '') + '" placeholder="' + iph + '" style="flex:1;min-width:0;height:28px;font-size:12px;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);color:var(--text-primary);border-radius:6px;padding:0 8px;outline:none;">'
+        + '<button type="button" onclick="saveSlotIsp(' + s.slot + ',this)" style="flex-shrink:0;height:28px;padding:0 10px;font-size:12px;font-weight:600;border-radius:6px;border:1px solid var(--border-color);background:transparent;color:var(--text-secondary);cursor:pointer;">设定</button>'
       + '</div>'
     + '</div>';
   });
@@ -5414,6 +5469,29 @@ async function saveSlotCountry(slot, btn) {
   }
 }
 
+async function saveSlotIsp(slot, btn) {
+  const old = btn.textContent; btn.disabled = true; btn.textContent = '...';
+  $("exit_slots_error").style.display = "none"; $("exit_slots_success").style.display = "none";
+  try {
+    const val = ($("slot_isp_" + slot) || {}).value || "";
+    const res = await fetch("./api/set_slot_isp", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ slot: slot, isp: val })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      $("exit_slots_success").textContent = '槽位 #' + slot + ' 运营商已设为 ' + (val || '跟随全局') + '，正在切换...';
+      $("exit_slots_success").style.display = "block";
+    } else {
+      $("exit_slots_error").textContent = data.error || "设定失败";
+      $("exit_slots_error").style.display = "block";
+    }
+  } catch (e) {
+    $("exit_slots_error").textContent = "请求失败: " + e; $("exit_slots_error").style.display = "block";
+  } finally {
+    btn.disabled = false; btn.textContent = old; loadExitSlots(false);
+  }
+}
+
 async function saveExitSlots(event) {
   event.preventDefault();
   const btn = $("exit_slots_submit_btn");
@@ -5426,6 +5504,7 @@ async function saveExitSlots(event) {
     const payload = {
       count: parseInt($("slot_count").value || "0", 10),
       country: $("slot_country").value.trim(),
+      isp: ($("slot_isp") ? $("slot_isp").value : "").trim(),
       residential_only: $("slot_residential").checked
     };
     const res = await fetch("./api/update_exit_slots", {
@@ -6109,6 +6188,7 @@ class Handler(BaseHTTPRequestHandler):
                 "proxy_host": "127.0.0.1",
                 "port_base": SLOT_PORT_BASE,
                 "country_map": get_slot_country_map(),
+                "isp_map": get_slot_isp_map(),
                 "pin_map": get_slot_pin_map(),
                 "slots": state.get("slots", []),
                 "updated_at": state.get("updated_at", 0),
@@ -6368,6 +6448,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json_body()
                 count = payload.get("count")
                 country = payload.get("country")
+                isp = payload.get("isp")
                 residential_only = payload.get("residential_only")
                 if count is not None and not str(count).strip().lstrip("-").isdigit():
                     self.send_json({"ok": False, "error": "槽位数量必须为整数"}, HTTPStatus.BAD_REQUEST)
@@ -6376,6 +6457,7 @@ class Handler(BaseHTTPRequestHandler):
                     count=int(count) if count is not None else None,
                     country=country,
                     residential_only=residential_only,
+                    isp=isp,
                 )
                 # 立即触发一次供给，避免等待下个周期
                 threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
@@ -6395,6 +6477,20 @@ class Handler(BaseHTTPRequestHandler):
                 # 该槽位地区变了，重摇一次让它落到新地区
                 threading.Thread(target=switch_slot_node, args=(int(slot),), daemon=True).start()
                 self.send_json({"ok": True, "country_map": country_map, "message": "该槽位地区已更新，正在切换节点..."})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        elif effective_path == "/api/set_slot_isp":
+            try:
+                payload = self.read_json_body()
+                slot = payload.get("slot")
+                if slot is None or not str(slot).strip().lstrip("-").isdigit():
+                    self.send_json({"ok": False, "error": "缺少有效的槽位号"}, HTTPStatus.BAD_REQUEST)
+                    return
+                isp_map = set_slot_isp(int(slot), payload.get("isp"))
+                threading.Thread(target=switch_slot_node, args=(int(slot),), daemon=True).start()
+                self.send_json({"ok": True, "isp_map": isp_map, "message": "该槽位运营商已更新，正在切换节点..."})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
