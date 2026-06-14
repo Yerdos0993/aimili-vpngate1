@@ -5,6 +5,19 @@
 
 ---
 
+## [Fork 1.0.1] - 2026-06-14
+
+主连接(7928)可靠性修复：根治节点自动切换后下游 3x-ui/Xray 需手动重启才恢复的问题。
+
+### 修复 (Fixed)
+- **主连接(7928)切换后强制下游重连 + 假活节点冷却（根治"需重启 Xray"）**：主连接自动漂移到新节点后，下游 3x-ui/Xray 会复用切换前已黑洞化的连接/DNS，导致以主连接为出口 IP 的 3x-ui 节点协议出站断网，必须手动重启 xray 才恢复；且原主连接单次出口失败即切换、无坏节点冷却，易反复切到"握手成功但不转发"的假活节点。本次将多出口已验证的加固逻辑对齐到主连接：
+  - `proxy_server`：新增 `ConnRegistry` 跟踪主代理(7928)下游连接并支持一次性强制断开（先 `shutdown(SHUT_RDWR)` 唤醒阻塞在 select 的 relay 线程再 `close`）；新增 `purge_dns_cache` 按设备清隧道 DNS 缓存；`start_proxy_server` 增加可选 `registry` 参数（多出口不传，零影响，向后兼容）。
+  - `vpngate_manager`：主代理启动带 `registry`；`connect_node` 出口验证通过后调用 `reset_main_proxy_connections` 强制下游重连新隧道并清 `tun0` DNS，根治"切换后需重启 Xray"。
+  - **主连接对齐多出口加固**：`background_proxy_checker` 出口连续失败达 `MAIN_EGRESS_FAIL_THRESHOLD`（默认 2）次才切换，切前 `mark_main_bad_node` 将坏节点加入冷却（`MAIN_BAD_NODE_COOLDOWN` 默认 600s）；`auto_switch_node` 排除冷却期内的坏节点，避免切回"假活不转发"节点。
+- 新增可调环境变量：`MAIN_EGRESS_FAIL_THRESHOLD`、`MAIN_BAD_NODE_COOLDOWN`。
+
+> 验证：已 `py_compile` + 静态检查；端到端需在 Linux VPS 上实测自动切换后 3x-ui 出站自恢复。
+
 ## [Fork 1.0.0] - 2026-06-12
 
 首个二次开发版本，在保留上游全部能力的基础上新增多出口能力并做了性能/可靠性优化。
