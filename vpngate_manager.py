@@ -131,6 +131,12 @@ EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 30, 5)
 SLOT_EGRESS_CHECK_INTERVAL = env_int("SLOT_EGRESS_CHECK_INTERVAL", 45, 10)
 SLOT_EGRESS_FAIL_THRESHOLD = env_int("SLOT_EGRESS_FAIL_THRESHOLD", 2, 1)
 SLOT_BAD_NODE_COOLDOWN = env_int("SLOT_BAD_NODE_COOLDOWN", 600, 60)
+# 主连接(7928)出口加固：与多出口槽位对齐。
+#   - 连续失败阈值：避免单次抖动即切换，减少无谓漂移。
+#   - 坏节点冷却：切走“握手成功但不转发”的假活节点后，冷却期内不再选回它，防止 flapping。
+# 二者共同保证主连接切换后落到“真能转发”的节点，配合下游连接重置根治“切换后需重启 Xray”。
+MAIN_EGRESS_FAIL_THRESHOLD = env_int("MAIN_EGRESS_FAIL_THRESHOLD", 2, 1)
+MAIN_BAD_NODE_COOLDOWN = env_int("MAIN_BAD_NODE_COOLDOWN", 600, 60)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
@@ -158,6 +164,10 @@ active_openvpn_node_id = ""
 is_connecting = True
 last_active_ping_time = 0.0
 last_active_latency = 0
+# 主连接(7928)出口加固运行时状态
+main_egress_fail_count = 0                       # 出口连续失败计数，达到 MAIN_EGRESS_FAIL_THRESHOLD 才切换
+main_bad_nodes: dict[str, float] = {}            # node_id -> 冷却到期时间（出口不通的坏节点，暂时排除）
+main_proxy_registry = proxy_server.ConnRegistry()  # 主代理活跃下游连接登记，切换成功后强制下游重连
 
 last_collector_heartbeat = 0.0
 last_checker_heartbeat = 0.0
@@ -1436,6 +1446,32 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         
     return list(updated_nodes_map.values())
 
+def mark_main_bad_node(node_id: str) -> None:
+    """把主连接出口不通的节点加入冷却名单，冷却期内 auto_switch_node 不会再选回它。"""
+    nid = str(node_id or "").strip()
+    if nid:
+        main_bad_nodes[nid] = time.time() + MAIN_BAD_NODE_COOLDOWN
+
+def main_bad_node_ids() -> set[str]:
+    """当前仍在冷却期内的主连接坏节点 id 集合。"""
+    now = time.time()
+    return {nid for nid, until in main_bad_nodes.items() if until > now}
+
+def reset_main_proxy_connections() -> None:
+    """主连接切换/重连成功且出口已验证后调用：强制断开主代理(7928)上所有下游连接，
+    并清理 tun0 隧道 DNS 缓存。让 3x-ui/Xray 立即重连到新隧道，
+    根治“切换后下游复用旧黑洞连接、必须重启 Xray 才恢复”。"""
+    global main_egress_fail_count
+    main_egress_fail_count = 0
+    try:
+        n = main_proxy_registry.close_all()
+        proxy_server.purge_dns_cache("tun0")
+        if n:
+            print(f"[主代理] 节点切换完成，已重置 {n} 条下游连接并清隧道 DNS 缓存，强制其重连新隧道", flush=True)
+            log_to_json("INFO", "Proxy", f"主连接切换后重置 {n} 条下游连接，强制重连新隧道")
+    except Exception as e:
+        print(f"[主代理] 重置下游连接异常: {e}", flush=True)
+
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
@@ -1457,10 +1493,13 @@ def auto_switch_node(attempt: int = 0) -> None:
     # Find the next best available node
     with lock:
         nodes = read_nodes()
+        # 排除仍在冷却期内的坏节点（出口不通的假活节点），避免切回去后 Xray 又断流
+        bad = main_bad_node_ids()
         candidates = [
             n for n in nodes 
             if n.get("probe_status") == "available" 
             and not n.get("active")
+            and n.get("id") not in bad
         ]
         
         if routing_mode == "fixed_region" and target_country:
@@ -1633,6 +1672,9 @@ def connect_node(node_id: str) -> str:
                 proxy_latency_ms=res["latency_ms"],
                 proxy_error=""
             )
+            # 出口已验证可转发：强制断开主代理上的旧下游连接(3x-ui/Xray)，让其立即重连到新隧道。
+            # 首次连接时登记表为空，此调用为无害空操作；切换场景下这是根治“需重启 Xray”的关键。
+            reset_main_proxy_connections()
         else:
             set_state(
                 proxy_ok=False,
@@ -5912,7 +5954,7 @@ def check_proxy_health() -> dict[str, Any]:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
 
 def background_proxy_checker() -> None:
-    global last_checker_heartbeat, is_connecting
+    global last_checker_heartbeat, is_connecting, main_egress_fail_count
     time.sleep(30)
     while True:
         last_checker_heartbeat = time.time()
@@ -5929,6 +5971,7 @@ def background_proxy_checker() -> None:
                     proxy_latency_ms=res["latency_ms"],
                     proxy_error=""
                 )
+                main_egress_fail_count = 0
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
                 error_msg = res.get("error", "未知错误")
@@ -5946,7 +5989,12 @@ def background_proxy_checker() -> None:
                 if active_openvpn_node_id:
                     ui_cfg = load_ui_config()
                     routing_mode = ui_cfg.get("routing_mode", "auto")
-                    if routing_mode != "fixed_ip":
+                    # 连续失败阈值：单次出口抖动不立即切换/重连，避免无谓漂移与下游频繁断连。
+                    main_egress_fail_count += 1
+                    if main_egress_fail_count < MAIN_EGRESS_FAIL_THRESHOLD:
+                        print(f"[代理守护线程] 出口检测失败 {main_egress_fail_count}/{MAIN_EGRESS_FAIL_THRESHOLD} 次，暂不处理，继续观察。原因: {error_msg}", flush=True)
+                    elif routing_mode != "fixed_ip":
+                        main_egress_fail_count = 0
                         with lock:
                             nodes = read_nodes()
                             active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
@@ -5954,8 +6002,11 @@ def background_proxy_checker() -> None:
                                 mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
                                 active_node["probe_status"] = "unavailable"
                                 write_json(NODES_FILE, nodes)
+                        # 把当前(假活/不转发)节点加入冷却，确保 auto_switch_node 切到“真能转发”的别的节点
+                        mark_main_bad_node(active_openvpn_node_id)
                         auto_switch_node()
                     else:
+                        main_egress_fail_count = 0
                         print(f"[代理守护线程] 固定 IP 模式下代理不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
                         is_connecting = False
                         try:
@@ -6763,7 +6814,7 @@ def main() -> None:
             "blacklisted_nodes": 0,
         },
     )
-    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
+    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT, "tun0", None, main_proxy_registry), daemon=True).start()
     
     # Wait for the gateway to officially start
     print("[网关] 正在启动代理网关...", flush=True)

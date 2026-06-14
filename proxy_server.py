@@ -19,6 +19,43 @@ def parse_positive_int(value: str | None, default: int) -> int:
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 
+class ConnRegistry:
+    """跟踪某个代理监听实例当前活跃的下游客户端连接，支持一次性强制断开。
+
+    用途：主连接节点切换/重连成功后，强制断开该端口上所有下游(如 3x-ui/Xray)连接，
+    使其立即重连到新隧道，避免下游复用切换前已黑洞化的连接或连接池，导致
+    “切换后无网络、必须重启下游进程才恢复”。close_all 先 shutdown 再 close，
+    确保正阻塞在 select 的 relay 线程能被唤醒并退出。"""
+
+    def __init__(self) -> None:
+        self._conns: set[socket.socket] = set()
+        self._lock = threading.Lock()
+
+    def add(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._conns.add(sock)
+
+    def discard(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._conns.discard(sock)
+
+    def close_all(self) -> int:
+        with self._lock:
+            conns = list(self._conns)
+            self._conns.clear()
+        closed = 0
+        for s in conns:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+                closed += 1
+            except OSError:
+                pass
+        return closed
+
 def parse_int(value: Any) -> int:
     try:
         return int(value)
@@ -221,6 +258,22 @@ def resolve_dns_over_tun0(host: str, dns_server: str | None = None, timeout: flo
                 _dns_cache.clear()
             _dns_cache[cache_key] = (resolved, now)
     return resolved
+
+def purge_dns_cache(device: str | None = None) -> int:
+    """清理隧道内 DNS 解析缓存。device 给定时只清该设备(如 tun0)的条目，否则清空全部。
+
+    主连接切换节点后调用：旧出口视角解析到的 IP 可能不再是新出口的最优/可达解析，
+    清掉可避免新隧道复用旧解析结果。返回清理条数。"""
+    with _dns_cache_lock:
+        if device is None:
+            n = len(_dns_cache)
+            _dns_cache.clear()
+            return n
+        prefix = f"{device}|"
+        keys = [k for k in _dns_cache if k.startswith(prefix)]
+        for k in keys:
+            _dns_cache.pop(k, None)
+        return len(keys)
 
 def create_connection(address: tuple[str, int], timeout: float = 20, device: str = "tun0") -> socket.socket:
     host, port = address
@@ -473,7 +526,7 @@ def proxy_client(client: socket.socket, address: tuple[str, int], device: str = 
         except OSError:
             pass
 
-def start_proxy_server(host: str, port: int, device: str = "tun0", stop_event: threading.Event | None = None) -> None:
+def start_proxy_server(host: str, port: int, device: str = "tun0", stop_event: threading.Event | None = None, registry: ConnRegistry | None = None) -> None:
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     server = None
@@ -552,8 +605,12 @@ def start_proxy_server(host: str, port: int, device: str = "tun0", stop_event: t
 
             def run_client() -> None:
                 try:
+                    if registry is not None:
+                        registry.add(client)
                     proxy_client(client, address, device)
                 finally:
+                    if registry is not None:
+                        registry.discard(client)
                     proxy_connection_sem.release()
 
             threading.Thread(target=run_client, daemon=True).start()
