@@ -1,0 +1,35 @@
+services:
+  aimilivpn:
+    build:
+      context: .
+    image: aimilivpn:local
+    container_name: aimilivpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "2"
+      net.ipv4.conf.default.rp_filter: "2"
+    environment:
+      VPNGATE_DATA_DIR: /data
+      UI_HOST: 0.0.0.0
+      UI_PORT: 8787
+      LOCAL_PROXY_HOST: 0.0.0.0
+      LOCAL_PROXY_PORT: 7928
+      SLOT_PROXY_HOST: 0.0.0.0
+      # Optional tuning examples:
+      # OPENVPN_TEST_CONCURRENCY: 8
+      # TCP_PRESCREEN_CONCURRENCY: 100
+      # MULTI_EXIT_SLOTS: 0
+    ports:
+      - "${AIMILIVPN_UI_BIND:-0.0.0.0}:${AIMILIVPN_UI_PORT:-8787}:8787/tcp"
+      - "${AIMILIVPN_PROXY_BIND:-127.0.0.1}:${AIMILIVPN_PROXY_PORT:-7928}:7928/tcp"
+      - "${AIMILIVPN_SLOTS_BIND:-127.0.0.1}:17928-17943:17928-17943/tcp"
+    volumes:
+      - aimilivpn-data:/data
+    stop_grace_period: 20s
+
+volumes:
+  aimilivpn-data:

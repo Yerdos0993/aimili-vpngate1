@@ -35,6 +35,51 @@ bash <(curl -Ls https://raw.githubusercontent.com/Guli-Joy/aimili-vpngate/main/i
 
 如需指定自定义仓库（例如你自己的二开分叉）：`bash install.sh <github_user> <repo_name>`。
 
+### 🐳 Docker 部署
+
+要求：Linux 宿主机已启用 `/dev/net/tun`，并安装 Docker Engine 与 Docker Compose v2。项目需要 `NET_ADMIN` 能力来创建 TUN 设备和策略路由。
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+首次启动后，查看自动生成的后台账号、密码和安全路径：
+
+```bash
+docker compose exec aimilivpn cat /data/ui_auth.json
+```
+
+随后访问 `http://服务器IP:8787/<secret_path>/`。默认端口策略为：
+
+- `8787`：管理后台，对外监听；请用云安全组/防火墙限制来源 IP。
+- `7928`：主 HTTP/SOCKS5 代理，只发布到宿主机 `127.0.0.1`。
+- `17928-17943`：最多 16 个多出口代理，只发布到宿主机 `127.0.0.1`。
+
+数据保存在命名卷 `aimilivpn-data` 中，重新构建镜像不会丢失配置。查看日志和停止服务：
+
+```bash
+docker compose logs -f aimilivpn
+docker compose down
+```
+
+不用 Compose 时也可以直接运行：
+
+```bash
+docker build -t aimilivpn:local .
+docker run -d --name aimilivpn --restart unless-stopped \
+  --cap-add NET_ADMIN --device /dev/net/tun \
+  --sysctl net.ipv4.conf.all.rp_filter=2 \
+  --sysctl net.ipv4.conf.default.rp_filter=2 \
+  -p 8787:8787 \
+  -p 127.0.0.1:7928:7928 \
+  -p 127.0.0.1:17928-17943:17928-17943 \
+  -v aimilivpn-data:/data \
+  aimilivpn:local
+```
+
+> 容器默认使用独立网络命名空间。若 3x-ui/Xray 也运行在容器中，请让它通过宿主机地址访问上述本地发布端口，或把两个服务放到同一 Docker 网络并按你的网络拓扑调整代理地址。
+
 #### 🔄 已部署过？这样更新
 **直接重跑上面的一键命令即可**——脚本会对已存在的 `/opt/aimilivpn` 执行 `git fetch` + 强制重置到最新源码并重启服务，**保留你的账号密码与全部配置**（`vpngate_data/` 不会被动）。
 
