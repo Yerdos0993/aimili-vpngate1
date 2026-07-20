@@ -30,8 +30,6 @@ COPY scripts/ ./scripts/
 RUN chmod +x /app/docker-entrypoint.sh /app/scripts/selfcheck_multiexit.sh \
     && mkdir -p /data
 
-VOLUME ["/data"]
-
 EXPOSE 8787 7928 17928-17943
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
